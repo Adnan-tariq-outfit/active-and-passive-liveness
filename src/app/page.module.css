@@ -1,0 +1,206 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  font-family: var(--font-geist-sans);
+}
+
+.videoContainer {
+  position: relative;
+  width: 100%;
+  max-width: 640px;
+  aspect-ratio: 16/12;
+  margin-bottom: 2rem;
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  background: #000;
+}
+
+.video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transform: scaleX(-1); /* Mirror for better UX */
+}
+
+.canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  object-fit: cover;
+  transform: scaleX(-1); /* Mirror to match video */
+}
+
+.content {
+  width: 100%;
+  max-width: 640px;
+  background: white;
+  border-radius: 16px;
+  padding: 2rem;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+
+.title {
+  font-size: 2rem;
+  font-weight: 700;
+  margin: 0 0 1.5rem 0;
+  text-align: center;
+  color: #1a1a1a;
+}
+
+.error {
+  background: #fee;
+  color: #c33;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  border: 1px solid #fcc;
+}
+
+.statusContainer {
+  margin-bottom: 2rem;
+}
+
+.status {
+  font-size: 1.25rem;
+  font-weight: 600;
+  text-align: center;
+  margin: 0 0 1rem 0;
+  color: #333;
+  min-height: 2rem;
+}
+
+.progressBar {
+  width: 100%;
+  height: 8px;
+  background: #e0e0e0;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 1rem;
+}
+
+.progressFill {
+  height: 100%;
+  background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+  transition: width 0.3s ease;
+  border-radius: 4px;
+}
+
+.success {
+  text-align: center;
+  padding: 2rem;
+  background: linear-gradient(135deg, #84fab0 0%, #8fd3f4 100%);
+  border-radius: 12px;
+  margin-bottom: 1.5rem;
+}
+
+.success h2 {
+  margin: 0 0 0.5rem 0;
+  color: #1a1a1a;
+  font-size: 1.5rem;
+}
+
+.success p {
+  margin: 0;
+  color: #555;
+  font-size: 1rem;
+}
+
+.instructions {
+  margin-top: 2rem;
+}
+
+.instructions h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0 0 1rem 0;
+  color: #333;
+}
+
+.instructions ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.instructions li {
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.5rem;
+  border-radius: 8px;
+  background: #f5f5f5;
+  color: #666;
+  transition: all 0.3s ease;
+  border-left: 4px solid transparent;
+}
+
+.instructions li.active {
+  background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+  color: #667eea;
+  border-left-color: #667eea;
+  font-weight: 600;
+  transform: translateX(4px);
+}
+
+@media (max-width: 768px) {
+  .container {
+    padding: 1rem;
+  }
+
+  .content {
+    padding: 1.5rem;
+  }
+
+  .title {
+    font-size: 1.5rem;
+  }
+
+  .status {
+    font-size: 1rem;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .container {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  }
+
+  .content {
+    background: #1a1a1a;
+    color: #ededed;
+  }
+
+  .title {
+    color: #ededed;
+  }
+
+  .status {
+    color: #ededed;
+  }
+
+  .instructions h3 {
+    color: #ededed;
+  }
+
+  .instructions li {
+    background: #2a2a2a;
+    color: #999;
+  }
+
+  .instructions li.active {
+    background: linear-gradient(135deg, #667eea25 0%, #764ba225 100%);
+    color: #8fa4ff;
+  }
+
+  .progressBar {
+    background: #2a2a2a;
+  }
+}
