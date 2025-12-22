@@ -803,7 +803,7 @@ export default function OptimizedFaceLiveness() {
 
         if (camera) {
           await camera.start();
-          setStatus("Please blink your eyes twice 👁️");
+        //   setStatus("");
         }
       } catch (err: unknown) {
         console.error("Error initializing face detection:", err);
