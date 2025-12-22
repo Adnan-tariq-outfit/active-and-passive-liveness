@@ -296,7 +296,7 @@ export default function FaceLiveness() {
         if (camera) {
           await camera.start();
         }
-        setStatus("Please blink your eyes 👁️");
+        // setStatus("Please blink your eyes 👁️");
       } catch (err: unknown) {
         console.error("Error initializing face detection:", err);
         const error = err as { message?: string };
