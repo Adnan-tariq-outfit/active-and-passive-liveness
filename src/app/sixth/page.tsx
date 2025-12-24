@@ -17,6 +17,7 @@ interface DetectionState {
   smileDetected: boolean;
   headTurnLeft: boolean;
   headTurnRight: boolean;
+  headTurnConsecutiveFrames: number; // For proper turn detection
   lastEyeAspectRatio: number;
   consecutiveFrames: number;
 
@@ -109,6 +110,7 @@ export default function OptimizedFaceLiveness() {
     smileDetected: false,
     headTurnLeft: false,
     headTurnRight: false,
+    headTurnConsecutiveFrames: 0,
     lastEyeAspectRatio: 0.3,
     consecutiveFrames: 0,
     smileConsecutiveFrames: 0,
@@ -518,71 +520,113 @@ export default function OptimizedFaceLiveness() {
       setIsSubmitting(false);
     }
   }, [calculatePassiveLiveness]);
-  // Optimized head turn detection with verification delay
+  // ✅ Stricter head turn detection - requires proper turn, not small movements
   const handleHeadTurnDetection = useCallback(
     (landmarks: FaceLandmark[], direction: "left" | "right") => {
       const state = detectionStateRef.current;
       if (state.isTransitioning) return;
 
       const headPose = calculateHeadPose(landmarks);
+      
+      // ✅ Stricter thresholds - require more significant turn
+      const LEFT_TURN_THRESHOLD = -0.25;  // More strict (was -0.18)
+      const RIGHT_TURN_THRESHOLD = 0.25;  // More strict (was 0.18)
+      const MIN_CONSECUTIVE_FRAMES = 8;   // Must hold turn for 8 frames (~250ms at 30fps)
+      const NEUTRAL_THRESHOLD = 0.1;      // Consider straight if within this range
 
-      if (direction === "left" && headPose < -0.18 && !state.headTurnLeft) {
-        state.headTurnLeft = true;
+      if (direction === "left") {
+        // Check if face is properly turned left
+        if (headPose < LEFT_TURN_THRESHOLD) {
+          state.headTurnConsecutiveFrames++;
+          
+          // Show progress feedback
+          if (state.headTurnConsecutiveFrames < MIN_CONSECUTIVE_FRAMES) {
+            const progress = Math.min(
+              (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
+              90
+            );
+            setStatus(`Turn your head more left... (${Math.round(progress)}%) 👈`);
+          }
+          
+          // ✅ Only detect if held for minimum frames
+          if (
+            state.headTurnConsecutiveFrames >= MIN_CONSECUTIVE_FRAMES &&
+            !state.headTurnLeft
+          ) {
+            state.headTurnLeft = true;
 
-        // Capture photo immediately
-        if (!state.capturedPhotos.turnLeft) {
-          const photo = capturePhoto("TURN_LEFT");
-          state.capturedPhotos.turnLeft = photo;
-          setCapturedCount((prev) => prev + 1);
-          setPreviewPhotos((prev) => [...prev, photo]);
+            // Capture photo
+            if (!state.capturedPhotos.turnLeft) {
+              const photo = capturePhoto("TURN_LEFT");
+              state.capturedPhotos.turnLeft = photo;
+              setCapturedCount((prev) => prev + 1);
+              setPreviewPhotos((prev) => [...prev, photo]);
+            }
+
+            setStatus("Left turn detected! ✓");
+            setTimeout(() => {
+              transitionToNextStep(
+                "TURN_RIGHT",
+                "Good! Now turn your head right 👉",
+                75
+              );
+            }, 500);
+          }
+        } else if (headPose > -NEUTRAL_THRESHOLD) {
+          // Reset if face returns to neutral or turns right
+          if (state.headTurnConsecutiveFrames > 0) {
+            state.headTurnConsecutiveFrames = 0;
+            if (!state.headTurnLeft) {
+              setStatus("Turn your head left 👈");
+            }
+          }
         }
+      } else if (direction === "right") {
+        // Check if face is properly turned right
+        if (headPose > RIGHT_TURN_THRESHOLD) {
+          state.headTurnConsecutiveFrames++;
+          
+          // Show progress feedback
+          if (state.headTurnConsecutiveFrames < MIN_CONSECUTIVE_FRAMES) {
+            const progress = Math.min(
+              (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
+              90
+            );
+            setStatus(`Turn your head more right... (${Math.round(progress)}%) 👉`);
+          }
+          
+          // ✅ Only detect if held for minimum frames
+          if (
+            state.headTurnConsecutiveFrames >= MIN_CONSECUTIVE_FRAMES &&
+            !state.headTurnRight
+          ) {
+            state.headTurnRight = true;
 
-        setStatus("Left turn detected! ✓");
-        setTimeout(() => {
-          transitionToNextStep(
-            "TURN_RIGHT",
-            "Good! Now turn your head right 👉",
-            75
-          );
-        }, 500);
-      } else if (
-        direction === "left" &&
-        headPose >= -0.18 &&
-        state.headTurnLeft
-      ) {
-        // Reset if they turn back
-        state.headTurnLeft = false;
-        setStatus("Turn your head left 👈");
-      } else if (
-        direction === "right" &&
-        headPose > 0.18 &&
-        !state.headTurnRight
-      ) {
-        state.headTurnRight = true;
+            // Capture photo
+            if (!state.capturedPhotos.turnRight) {
+              const photo = capturePhoto("TURN_RIGHT");
+              state.capturedPhotos.turnRight = photo;
+              setCapturedCount((prev) => prev + 1);
+              setPreviewPhotos((prev) => [...prev, photo]);
+            }
 
-        // Capture photo immediately
-        if (!state.capturedPhotos.turnRight) {
-          const photo = capturePhoto("TURN_RIGHT");
-          state.capturedPhotos.turnRight = photo;
-          setCapturedCount((prev) => prev + 1);
-          setPreviewPhotos((prev) => [...prev, photo]);
+            setProgress(100);
+            setStatus("Right turn detected! ✓");
+
+            // Complete verification
+            setTimeout(() => {
+              completeVerification();
+            }, 500);
+          }
+        } else if (headPose < NEUTRAL_THRESHOLD) {
+          // Reset if face returns to neutral or turns left
+          if (state.headTurnConsecutiveFrames > 0) {
+            state.headTurnConsecutiveFrames = 0;
+            if (!state.headTurnRight) {
+              setStatus("Turn your head right 👉");
+            }
+          }
         }
-
-        setProgress(100);
-        setStatus("Right turn detected! ✓");
-
-        // Complete verification
-        setTimeout(() => {
-          completeVerification();
-        }, 500);
-      } else if (
-        direction === "right" &&
-        headPose <= 0.18 &&
-        state.headTurnRight
-      ) {
-        // Reset if they turn back
-        state.headTurnRight = false;
-        setStatus("Turn your head right 👉");
       }
     },
     [capturePhoto, transitionToNextStep, completeVerification]
