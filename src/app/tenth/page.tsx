@@ -910,7 +910,7 @@ export default function OptimizedFaceVerification() {
     let camera: CameraInstance | null = null;
     const videoElement = videoRef.current;
 
-    const loadMediaPipe = async () => {
+    const loadMediaPipe = async () => { 
       try {
         setError(null);
 
