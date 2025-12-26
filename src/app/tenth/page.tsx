@@ -9,7 +9,13 @@ import type {
   CameraConfig,
 } from "@/types/mediapipe";
 
-type GestureStep = "BLINK" | "SMILE" | "TURN_LEFT" | "TURN_RIGHT" | "COMPLETE";
+type GestureStep =
+  | "CAPTURE_REFERENCE"
+  | "BLINK"
+  | "SMILE"
+  | "TURN_LEFT"
+  | "TURN_RIGHT"
+  | "COMPLETE";
 
 interface DetectionState {
   blinkCount: number;
@@ -17,28 +23,21 @@ interface DetectionState {
   smileDetected: boolean;
   headTurnLeft: boolean;
   headTurnRight: boolean;
-  headTurnConsecutiveFrames: number; // For proper turn detection
+  headTurnConsecutiveFrames: number;
   lastEyeAspectRatio: number;
   consecutiveFrames: number;
-
-  // Smile detection stability
   smileConsecutiveFrames: number;
   lastMouthOpenness: number;
   lastSmileLandmarks: FaceLandmark[] | null;
-
-  // ✅ Improved smile detection with baseline
   baselineMouthWidth?: number;
   neutralSmileFrames: number;
-
-  // Photo capture
   capturedPhotos: {
+    reference?: string;
     blink?: string;
     smile?: string;
     turnLeft?: string;
     turnRight?: string;
   };
-
-  // Passive Liveness (continuous background monitoring)
   depthVariationScore: number;
   motionScore: number;
   lastLandmarks: FaceLandmark[] | null;
@@ -55,22 +54,24 @@ interface DetectionState {
     angleVariation: boolean;
     blinkPattern: boolean;
   };
-
-  // Timing
   startTime: number;
-
-  // Transition control
   isTransitioning: boolean;
-
-  // ✅ NEW: Error handling
   errorFrameCount: number;
   lastError: string | null;
-  multipleFacesFrameCount: number; // Track consecutive multiple faces frames
+  multipleFacesFrameCount: number;
+}
+
+interface FaceComparisonResult {
+  match: boolean;
+  similarity: number;
+  distance: number;
+  message: string;
 }
 
 interface VerificationResult {
   success: boolean;
   photos: {
+    reference?: string;
     blink?: string;
     smile?: string;
     turnLeft?: string;
@@ -79,22 +80,26 @@ interface VerificationResult {
   confidence: number;
   antiSpoofingScore: number;
   passiveLivenessScore: number;
+  faceComparison: FaceComparisonResult | null;
   timestamp: number;
   duration: number;
 }
 
-export default function OptimizedFaceLiveness() {
+export default function OptimizedFaceVerification() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [status, setStatus] = useState("Position your face in the frame");
-  const [step, setStep] = useState<GestureStep>("BLINK");
+  const [status, setStatus] = useState("Ready to start verification");
+  const [step, setStep] = useState<GestureStep>("CAPTURE_REFERENCE");
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [capturedCount, setCapturedCount] = useState(0);
   const [previewPhotos, setPreviewPhotos] = useState<string[]>([]);
+  const [faceApiLoaded, setFaceApiLoaded] = useState(false);
+  const [faceComparisonResult, setFaceComparisonResult] =
+    useState<FaceComparisonResult | null>(null);
   const [passiveLivenessResult, setPassiveLivenessResult] = useState<{
     score: number;
     checks: {
@@ -106,7 +111,13 @@ export default function OptimizedFaceLiveness() {
       blinkPattern: boolean;
     };
   } | null>(null);
-  console.log(previewPhotos);
+  const [uploadedReferenceImage, setUploadedReferenceImage] = useState<
+    string | null
+  >(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ✅ OPTIMIZATION: Lazy load face-api.js only when needed
+  const faceApiRef = useRef<typeof import("face-api.js") | null>(null);
 
   const detectionStateRef = useRef<DetectionState>({
     blinkCount: 0,
@@ -128,7 +139,6 @@ export default function OptimizedFaceLiveness() {
     frameCount: 0,
     startTime: Date.now(),
     isTransitioning: false,
-    // Passive liveness state
     faceSizeVariation: [],
     faceAngleVariation: [],
     naturalBlinkDetected: false,
@@ -141,13 +151,104 @@ export default function OptimizedFaceLiveness() {
       angleVariation: false,
       blinkPattern: false,
     },
-    // ✅ NEW: Error handling
     errorFrameCount: 0,
     lastError: null,
     multipleFacesFrameCount: 0,
   });
 
-  // ✅ OPTIMIZED: Photo capture with minimal blocking and performance improvements
+  // ✅ OPTIMIZATION: Load face-api.js models lazily (only when verification starts)
+  const loadFaceApiModels = useCallback(async () => {
+    if (faceApiLoaded) return true;
+
+    try {
+      console.log("🔄 Loading face-api.js models...");
+      setStatus("Loading face recognition models...");
+
+      // Dynamic import - only loads when needed
+      const faceapi = await import("face-api.js");
+      faceApiRef.current = faceapi;
+
+      const LOCAL_MODEL_URL = "/models";
+      const CDN_MODEL_URL =
+        "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
+
+      try {
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(LOCAL_MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(LOCAL_MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(LOCAL_MODEL_URL),
+        ]);
+        console.log("✅ Models loaded from local folder");
+      } catch (localError) {
+        console.warn("⚠️ Local models not found, trying CDN...");
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(CDN_MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(CDN_MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(CDN_MODEL_URL),
+        ]);
+        console.log("✅ Models loaded from CDN");
+      }
+
+      setFaceApiLoaded(true);
+      console.log("✅ Face-api.js models ready");
+      return true;
+    } catch (err) {
+      console.error("❌ Error loading models:", err);
+      setError("Failed to load face recognition models. Please refresh.");
+      return false;
+    }
+  }, [faceApiLoaded]);
+
+  // Handle reference image upload from local disk
+  const handleReferenceImageUpload = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const imageUrl = event.target?.result as string;
+          setUploadedReferenceImage(imageUrl);
+
+          const state = detectionStateRef.current;
+          state.capturedPhotos.reference = imageUrl;
+
+          setCapturedCount(1);
+          setPreviewPhotos([imageUrl]);
+          setStatus(
+            "Reference image uploaded! Click 'Start Verification' to begin."
+          );
+
+          console.log("📁 Reference image uploaded from disk");
+        };
+        reader.readAsDataURL(file);
+      }
+    },
+    []
+  );
+
+  // Start verification process
+  const startVerificationProcess = useCallback(async () => {
+    if (!uploadedReferenceImage) {
+      setError("Please upload a reference image first");
+      return;
+    }
+
+    // ✅ Load face-api models when verification starts (not on page load)
+    setStatus("Loading face recognition models...");
+    const loaded = await loadFaceApiModels();
+
+    if (!loaded) {
+      setError("Failed to load face recognition models");
+      return;
+    }
+
+    setStep("BLINK");
+    setProgress(0);
+    setStatus("Please blink your eyes twice 👁️");
+    console.log("🚀 Starting liveness verification process");
+  }, [uploadedReferenceImage, loadFaceApiModels]);
+
+  // Photo capture function
   const capturePhoto = useCallback((gestureType: string): string => {
     const video = videoRef.current;
     const captureCanvas = captureCanvasRef.current;
@@ -164,7 +265,6 @@ export default function OptimizedFaceLiveness() {
     const ctx = captureCanvas.getContext("2d", { alpha: false });
     if (!ctx) return "";
 
-    // ✅ Only set dimensions if changed (expensive operation)
     if (
       captureCanvas.width !== video.videoWidth ||
       captureCanvas.height !== video.videoHeight
@@ -197,23 +297,117 @@ export default function OptimizedFaceLiveness() {
     return photoData;
   }, []);
 
-  // Smooth transition helper
+  // ✅ OPTIMIZATION: Run face comparison in background (non-blocking)
+  const compareFaces = useCallback(
+    async (
+      referenceImage: string,
+      compareImage: string
+    ): Promise<FaceComparisonResult> => {
+      try {
+        console.log("🔍 Comparing faces in background...");
+
+        if (!faceApiRef.current) {
+          throw new Error("Face-api.js not loaded");
+        }
+
+        const faceapi = faceApiRef.current;
+
+        // ✅ Run comparison in separate microtask to avoid blocking UI
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        const img1 = await faceapi.fetchImage(referenceImage);
+        const detection1 = await faceapi
+          .detectSingleFace(img1, new faceapi.TinyFaceDetectorOptions())
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        const img2 = await faceapi.fetchImage(compareImage);
+        const detection2 = await faceapi
+          .detectSingleFace(img2, new faceapi.TinyFaceDetectorOptions())
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+
+        if (!detection1 || !detection2) {
+          return {
+            match: false,
+            similarity: 0,
+            distance: Infinity,
+            message: "❌ Could not detect face in one or both images",
+          };
+        }
+
+        const descriptor1 = detection1.descriptor;
+        const descriptor2 = detection2.descriptor;
+
+        let distance = 0;
+        for (let i = 0; i < descriptor1.length; i++) {
+          distance += Math.pow(descriptor1[i] - descriptor2[i], 2);
+        }
+        distance = Math.sqrt(distance);
+
+        const similarity = Math.max(0, (1 - distance) * 100);
+        const THRESHOLD = 0.6;
+        const match = distance < THRESHOLD;
+
+        let message = "";
+        if (match) {
+          if (similarity >= 85) {
+            message = `✅ Same person confirmed! (${similarity.toFixed(
+              1
+            )}% similarity)`;
+          } else if (similarity >= 70) {
+            message = `✅ Likely same person (${similarity.toFixed(
+              1
+            )}% similarity)`;
+          } else {
+            message = `⚠️ Possibly same person (${similarity.toFixed(
+              1
+            )}% similarity)`;
+          }
+        } else {
+          message = `❌ Different person detected (${similarity.toFixed(
+            1
+          )}% similarity)`;
+        }
+
+        console.log("✅ Face comparison complete:", {
+          match,
+          similarity: similarity.toFixed(2),
+        });
+
+        return {
+          match,
+          similarity: Math.round(similarity * 100) / 100,
+          distance: Math.round(distance * 10000) / 10000,
+          message,
+        };
+      } catch (err) {
+        console.error("Error comparing faces:", err);
+        return {
+          match: false,
+          similarity: 0,
+          distance: Infinity,
+          message: "❌ Error during face comparison",
+        };
+      }
+    },
+    []
+  );
+
   const transitionToNextStep = useCallback(
     (nextStep: GestureStep, nextStatus: string, nextProgress: number) => {
       const state = detectionStateRef.current;
-
-      // Prevent multiple transitions
       if (state.isTransitioning) return;
 
       state.isTransitioning = true;
 
-      // Use requestAnimationFrame for smooth transition
       requestAnimationFrame(() => {
         setProgress(nextProgress);
         setStep(nextStep);
         setStatus(nextStatus);
 
-        // Reset transition flag after a short delay
         setTimeout(() => {
           state.isTransitioning = false;
         }, 100);
@@ -222,7 +416,6 @@ export default function OptimizedFaceLiveness() {
     []
   );
 
-  // ✅ Improved Blink Detection with Duration Check
   const handleBlinkDetection = useCallback(
     (landmarks: FaceLandmark[]) => {
       const state = detectionStateRef.current;
@@ -239,22 +432,18 @@ export default function OptimizedFaceLiveness() {
       const eyesClosed = avgEAR < EYE_CLOSED_THRESHOLD;
       const eyesOpen = avgEAR > EYE_OPEN_THRESHOLD;
 
-      // Track when eyes start closing
       if (eyesClosed && state.lastEyeAspectRatio > EYE_OPEN_THRESHOLD) {
         state.consecutiveFrames = 1;
         state.blinkStartTime = Date.now();
       } else if (eyesClosed && state.lastEyeAspectRatio <= EYE_OPEN_THRESHOLD) {
-        // Eyes still closed - increment consecutive frames
         state.consecutiveFrames++;
       } else if (
         eyesOpen &&
         state.lastEyeAspectRatio < EYE_CLOSED_THRESHOLD &&
         state.consecutiveFrames >= MIN_CONSECUTIVE_FRAMES
       ) {
-        // ✅ CRITICAL: Check blink duration (80-400ms for natural blink)
         const blinkDuration = Date.now() - (state.blinkStartTime || Date.now());
         if (blinkDuration >= 80 && blinkDuration <= 400) {
-          // Valid natural blink detected!
           state.blinkCount++;
           state.naturalBlinkDetected = true;
 
@@ -277,7 +466,6 @@ export default function OptimizedFaceLiveness() {
             setStatus(`Blink detected (${state.blinkCount}/2) 👁️`);
           }
         }
-        // Reset state after blink check
         state.consecutiveFrames = 0;
         state.blinkStartTime = undefined;
       } else if (eyesOpen) {
@@ -286,7 +474,6 @@ export default function OptimizedFaceLiveness() {
 
       state.lastEyeAspectRatio = avgEAR;
 
-      // Show instruction if no blinks yet
       if (state.blinkCount === 0 && !state.capturedPhotos.blink) {
         setStatus("Please blink your eyes twice 👁️");
       }
@@ -294,7 +481,6 @@ export default function OptimizedFaceLiveness() {
     [capturePhoto, transitionToNextStep]
   );
 
-  // ✅ FIXED: Improved Smile Detection - removed head pose blocking
   const handleSmileDetection = useCallback(
     (landmarks: FaceLandmark[]) => {
       const state = detectionStateRef.current;
@@ -302,10 +488,8 @@ export default function OptimizedFaceLiveness() {
 
       state.frameCount++;
 
-      // Get mouth metrics
       const { mouthOpen, mouthWidth } = getMouthMetrics(landmarks);
 
-      // 1️⃣ Collect neutral baseline (first 15 frames)
       if (!state.baselineMouthWidth) {
         state.neutralSmileFrames++;
         state.baselineMouthWidth = (state.baselineMouthWidth || 0) + mouthWidth;
@@ -318,24 +502,17 @@ export default function OptimizedFaceLiveness() {
         return;
       }
 
-      // 2️⃣ Calculate relative smile strength (compared to baseline)
       const widthIncrease =
         (mouthWidth - state.baselineMouthWidth) / state.baselineMouthWidth;
-
-      // ✅ FIXED: More lenient smile detection criteria
       const isSmile =
-        widthIncrease > 0.12 && // Reduced from 0.15 to 0.12 (more sensitive)
-        mouthOpen > 0.006 && // Reduced from 0.008 (more sensitive)
-        mouthOpen < 0.08; // Increased from 0.06 (more forgiving)
+        widthIncrease > 0.12 && mouthOpen > 0.006 && mouthOpen < 0.08;
 
       if (isSmile) {
         state.smileConsecutiveFrames++;
 
-        // Need 3 consecutive frames for stable detection
         if (state.smileConsecutiveFrames >= 3) {
           state.smileDetected = true;
 
-          // Capture photo immediately
           if (!state.capturedPhotos.smile) {
             const photo = capturePhoto("SMILE");
             state.capturedPhotos.smile = photo;
@@ -359,31 +536,16 @@ export default function OptimizedFaceLiveness() {
         setStatus("Please smile naturally 😊");
       }
 
-      // Update tracking values
       state.lastMouthOpenness = mouthOpen;
       state.lastSmileLandmarks = landmarks.map((l) => ({ ...l }));
-
-      // Debug logging every 30 frames
-      if (state.frameCount % 30 === 0) {
-        console.log("😊 Smile Detection:", {
-          baselineMouthWidth: state.baselineMouthWidth?.toFixed(4),
-          currentMouthWidth: mouthWidth.toFixed(4),
-          widthIncrease: (widthIncrease * 100).toFixed(1) + "%",
-          mouthOpen: mouthOpen.toFixed(4),
-          consecutiveFrames: state.smileConsecutiveFrames,
-          RESULT: isSmile ? "✅ SMILING" : "❌ NOT SMILING",
-        });
-      }
     },
     [capturePhoto, transitionToNextStep]
   );
 
-  // Comprehensive Passive Liveness Detection (runs continuously)
   const calculatePassiveLiveness = useCallback(
     (landmarks: FaceLandmark[]): number => {
       const state = detectionStateRef.current;
 
-      // 1. Face Presence Check
       const facePresence = landmarks.length > 0;
       state.passiveLivenessChecks.facePresence = facePresence;
 
@@ -392,12 +554,9 @@ export default function OptimizedFaceLiveness() {
         return 0;
       }
 
-      // 2. Face Size Consistency (detects static photos)
       const faceSize = calculateFaceSize(landmarks);
       state.faceSizeVariation.push(faceSize);
-      if (state.faceSizeVariation.length > 30) {
-        state.faceSizeVariation.shift(); // Keep last 30 frames
-      }
+      if (state.faceSizeVariation.length > 30) state.faceSizeVariation.shift();
 
       const sizeConsistency =
         state.faceSizeVariation.length > 10
@@ -405,12 +564,10 @@ export default function OptimizedFaceLiveness() {
           : true;
       state.passiveLivenessChecks.sizeConsistency = sizeConsistency;
 
-      // 3. Face Angle Variation (natural head movements)
       const faceAngle = calculateFaceAngle(landmarks);
       state.faceAngleVariation.push(faceAngle);
-      if (state.faceAngleVariation.length > 30) {
+      if (state.faceAngleVariation.length > 30)
         state.faceAngleVariation.shift();
-      }
 
       const angleVariation =
         state.faceAngleVariation.length > 10
@@ -418,7 +575,6 @@ export default function OptimizedFaceLiveness() {
           : false;
       state.passiveLivenessChecks.angleVariation = angleVariation;
 
-      // 4. Depth Variation (3D depth - real face indicator)
       if (state.lastLandmarks && state.frameCount % 3 === 0) {
         const depthChange = calculateDepthVariation(
           landmarks,
@@ -429,7 +585,6 @@ export default function OptimizedFaceLiveness() {
       const depthVariation = state.depthVariationScore > 0.1;
       state.passiveLivenessChecks.depthVariation = depthVariation;
 
-      // 5. Natural Movement Pattern
       if (state.lastLandmarks && state.frameCount % 3 === 0) {
         const motion = calculateMotionPattern(landmarks, state.lastLandmarks);
         state.motionScore += motion;
@@ -438,18 +593,15 @@ export default function OptimizedFaceLiveness() {
         state.motionScore > 0.05 && state.motionScore < 2.0;
       state.passiveLivenessChecks.naturalMovement = naturalMovement;
 
-      // 6. Blink Pattern (natural blinking)
       if (state.naturalBlinkDetected) {
         state.passiveLivenessChecks.blinkPattern = true;
       }
 
-      // Update landmarks
       if (state.frameCount % 5 === 0) {
         state.lastLandmarks = landmarks.map((l) => ({ ...l }));
       }
       state.frameCount++;
 
-      // Calculate passive liveness score (0-100)
       const checks = state.passiveLivenessChecks;
       let score = 0;
 
@@ -466,6 +618,7 @@ export default function OptimizedFaceLiveness() {
     []
   );
 
+  // ✅ OPTIMIZATION: Non-blocking verification completion
   const completeVerification = useCallback(async () => {
     const state = detectionStateRef.current;
 
@@ -473,112 +626,108 @@ export default function OptimizedFaceLiveness() {
     setStatus("Processing verification...");
     setIsSubmitting(true);
 
-    // Calculate final passive liveness score
-    const passiveScore = calculatePassiveLiveness(state.lastLandmarks || []);
-    const duration = Date.now() - state.startTime;
-
-    // Store passive liveness result for display
-    setPassiveLivenessResult({
-      score: passiveScore,
-      checks: { ...state.passiveLivenessChecks },
-    });
-
-    // Check if passive liveness passed (at least 50% score)
-    const livenessPassed = passiveScore >= 50;
-
-    const verificationData: VerificationResult = {
-      success: livenessPassed,
-      photos: state.capturedPhotos,
-      confidence: Math.round(passiveScore),
-      antiSpoofingScore: passiveScore,
-      passiveLivenessScore: passiveScore,
-      timestamp: Date.now(),
-      duration,
-    };
-
     try {
-      console.log("📤 Sending verification data to backend...");
-      console.log("Photos captured:", Object.keys(state.capturedPhotos).length);
+      const passiveScore = calculatePassiveLiveness(state.lastLandmarks || []);
+      const duration = Date.now() - state.startTime;
 
-      const response = await fetch(
-        "http://localhost:3001/api/verify-liveness-with-photos",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            userId: "demo-user-123",
-            sessionId: generateSessionId(),
-            verification: verificationData,
-          }),
-        }
-      );
+      setPassiveLivenessResult({
+        score: passiveScore,
+        checks: { ...state.passiveLivenessChecks },
+      });
 
-      if (response.ok) {
-        const result = await response.json();
-        console.log("✅ Backend response:", result);
-        setStatus("✅ Verification successful! All photos submitted.");
-      } else {
-        console.warn("⚠️ Backend not available");
-        setStatus("✅ Verification complete! (Backend offline - demo mode)");
+      const livenessPassed = passiveScore >= 50;
+
+      // ✅ Show liveness results immediately
+      setIsSubmitting(false);
+      setStatus("Liveness check complete! Comparing faces...");
+
+      // ✅ Run face comparison in background (non-blocking)
+      let comparisonResult: FaceComparisonResult | null = null;
+      if (state.capturedPhotos.reference && state.capturedPhotos.blink) {
+        console.log("🔍 Starting face comparison in background...");
+
+        // Run comparison without blocking UI
+        comparisonResult = await compareFaces(
+          state.capturedPhotos.reference,
+          state.capturedPhotos.blink
+        );
+        setFaceComparisonResult(comparisonResult);
+        console.log("✅ Face comparison complete");
       }
+
+      setStatus("✅ Verification complete!");
+
+      const verificationData: VerificationResult = {
+        success: livenessPassed && (comparisonResult?.match || false),
+        photos: state.capturedPhotos,
+        confidence: Math.round(passiveScore),
+        antiSpoofingScore: passiveScore,
+        passiveLivenessScore: passiveScore,
+        faceComparison: comparisonResult,
+        timestamp: Date.now(),
+        duration,
+      };
+
+      // ✅ Send to backend in background (non-blocking)
+      fetch("http://localhost:3001/api/verify-liveness-with-photos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: "demo-user-123",
+          sessionId: generateSessionId(),
+          verification: verificationData,
+        }),
+      })
+        .then((res) => res.ok && console.log("✅ Backend updated"))
+        .catch((err) => console.log("⚠️ Backend offline:", err));
 
       console.log("=== VERIFICATION DATA ===");
       console.log("Duration:", duration, "ms");
       console.log(
-        "Passive Liveness Score:",
+        "Liveness Score:",
         passiveScore,
         livenessPassed ? "✅ PASSED" : "❌ FAILED"
       );
-      console.log("Passive Liveness Checks:", state.passiveLivenessChecks);
+      console.log("Face Comparison:", comparisonResult);
     } catch (err) {
-      console.error("Error submitting to backend:", err);
-      setStatus("✅ Verification complete! (Backend offline - demo mode)");
-    } finally {
+      console.error("❌ Error during verification:", err);
+      setError("Error completing verification");
+      setStatus("❌ Verification failed");
       setIsSubmitting(false);
     }
-  }, [calculatePassiveLiveness]);
+  }, [calculatePassiveLiveness, compareFaces]);
 
-  // ✅ FIXED: Improved head turn detection
-  // ✅ Stricter head turn detection - requires proper turn, not small movements
   const handleHeadTurnDetection = useCallback(
     (landmarks: FaceLandmark[], direction: "left" | "right") => {
       const state = detectionStateRef.current;
       if (state.isTransitioning) return;
 
       const headPose = calculateHeadPose(landmarks);
-
-      // ✅ Stricter thresholds - require more significant turn
-      const LEFT_TURN_THRESHOLD = -0.25; // More strict (was -0.18)
-      const RIGHT_TURN_THRESHOLD = 0.25; // More strict (was 0.18)
-      const MIN_CONSECUTIVE_FRAMES = 8; // Must hold turn for 8 frames (~250ms at 30fps)
-      const NEUTRAL_THRESHOLD = 0.1; // Consider straight if within this range
+      const LEFT_TURN_THRESHOLD = -0.25;
+      const RIGHT_TURN_THRESHOLD = 0.25;
+      const MIN_CONSECUTIVE_FRAMES = 8;
+      const NEUTRAL_THRESHOLD = 0.1;
 
       if (direction === "left") {
-        // Check if face is properly turned left
         if (headPose < LEFT_TURN_THRESHOLD) {
           state.headTurnConsecutiveFrames++;
 
-          // Show progress feedback
           if (state.headTurnConsecutiveFrames < MIN_CONSECUTIVE_FRAMES) {
             const progress = Math.min(
               (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
               90
             );
             setStatus(
-              `Turn your head more left... (${Math.round(progress)}%) 👈`
+              `Turn your head more right... (${Math.round(progress)}%) 👉`
             );
           }
 
-          // ✅ Only detect if held for minimum frames
           if (
             state.headTurnConsecutiveFrames >= MIN_CONSECUTIVE_FRAMES &&
             !state.headTurnLeft
           ) {
             state.headTurnLeft = true;
 
-            // Capture photo
             if (!state.capturedPhotos.turnLeft) {
               const photo = capturePhoto("TURN_LEFT");
               state.capturedPhotos.turnLeft = photo;
@@ -590,26 +739,23 @@ export default function OptimizedFaceLiveness() {
             setTimeout(() => {
               transitionToNextStep(
                 "TURN_RIGHT",
-                "Good! Now turn your head right 👉",
+                "Good! Now turn your head left... 👈",
                 75
               );
             }, 500);
           }
         } else if (headPose > -NEUTRAL_THRESHOLD) {
-          // Reset if face returns to neutral or turns right
           if (state.headTurnConsecutiveFrames > 0) {
             state.headTurnConsecutiveFrames = 0;
             if (!state.headTurnLeft) {
-              setStatus("Turn your head left 👈");
+              setStatus("Turn your head right �");
             }
           }
         }
       } else if (direction === "right") {
-        // Check if face is properly turned right
         if (headPose > RIGHT_TURN_THRESHOLD) {
           state.headTurnConsecutiveFrames++;
 
-          // Show progress feedback
           if (state.headTurnConsecutiveFrames < MIN_CONSECUTIVE_FRAMES) {
             const progress = Math.min(
               (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
@@ -620,14 +766,12 @@ export default function OptimizedFaceLiveness() {
             );
           }
 
-          // ✅ Only detect if held for minimum frames
           if (
             state.headTurnConsecutiveFrames >= MIN_CONSECUTIVE_FRAMES &&
             !state.headTurnRight
           ) {
             state.headTurnRight = true;
 
-            // Capture photo
             if (!state.capturedPhotos.turnRight) {
               const photo = capturePhoto("TURN_RIGHT");
               state.capturedPhotos.turnRight = photo;
@@ -638,17 +782,15 @@ export default function OptimizedFaceLiveness() {
             setProgress(100);
             setStatus("Right turn detected! ✓");
 
-            // Complete verification
             setTimeout(() => {
               completeVerification();
             }, 500);
           }
         } else if (headPose < NEUTRAL_THRESHOLD) {
-          // Reset if face returns to neutral or turns left
           if (state.headTurnConsecutiveFrames > 0) {
             state.headTurnConsecutiveFrames = 0;
             if (!state.headTurnRight) {
-              setStatus("Turn your head right 👉");
+              setStatus("Turn your head left... �");
             }
           }
         }
@@ -657,28 +799,22 @@ export default function OptimizedFaceLiveness() {
     [capturePhoto, transitionToNextStep, completeVerification]
   );
 
-  // ✅ Frame counter for throttling canvas updates
   const frameCounterRef = useRef(0);
 
-  // ✅ FIXED: Improved results handler with better error management
   const onResults = useCallback(
     (results: FaceMeshResults) => {
-      // ✅ Throttle canvas updates (every 2nd frame for better performance)
       frameCounterRef.current++;
       const shouldUpdateCanvas = frameCounterRef.current % 2 === 0;
 
       const state = detectionStateRef.current;
 
-      // ✅ FIXED: Handle no face detection gracefully
       if (!results.multiFaceLandmarks?.length) {
         state.errorFrameCount++;
 
-        // Only show error after 5 consecutive error frames
         if (state.errorFrameCount > 5) {
           setStatus(
             "⚠️ No face detected. Please position your face in the frame"
           );
-          // ✅ Only set error if not already set (avoid unnecessary re-renders)
           if (state.lastError !== "No face detected") {
             state.lastError = "No face detected";
             setError("No face detected");
@@ -687,53 +823,37 @@ export default function OptimizedFaceLiveness() {
         return;
       }
 
-      // ✅ FIXED: Handle multiple faces - show warning after 3 consecutive frames
       if (results.multiFaceLandmarks.length > 1) {
         state.multipleFacesFrameCount++;
         const faceCount = results.multiFaceLandmarks.length;
-        
-        // ✅ Show error after 3 consecutive frames (prevents flickering)
+
         if (state.multipleFacesFrameCount >= 3) {
-          const multipleFacesError = `Multiple faces detected (${faceCount} faces). Please ensure only ONE person is visible.`;
-          
-          setStatus(
-            `🚫 ${faceCount} faces detected! Only 1 person allowed in frame.`
-          );
-          
-          // ✅ Only set error if not already set (avoid unnecessary re-renders)
+          const multipleFacesError = `Multiple faces detected (${faceCount} faces)`;
+          setStatus(`🚫 ${faceCount} faces detected! Only 1 person allowed.`);
+
           if (state.lastError !== multipleFacesError) {
             state.lastError = multipleFacesError;
             setError(multipleFacesError);
           }
-
-          // Log for debugging
-          if (state.multipleFacesFrameCount === 3) {
-            console.log(`🚨 MULTIPLE FACES ALERT: ${faceCount} faces detected`);
-          }
         }
 
-        // Don't process any gestures when multiple faces present
         return;
       }
 
-      // ✅ Reset multiple faces counter when single face detected
       if (state.multipleFacesFrameCount > 0) {
         state.multipleFacesFrameCount = 0;
       }
 
-      // ✅ FIXED: Single face detected - IMMEDIATELY clear all errors
-      // This ensures error is cleared as soon as valid face is detected
       if (state.errorFrameCount > 0 || state.lastError) {
         state.errorFrameCount = 0;
         state.lastError = null;
-        setError(null); // ✅ Clear error immediately when face detected
+        setError(null);
       }
 
       const landmarks = results.multiFaceLandmarks[0] as FaceLandmark[];
       const canvas = canvasRef.current;
       const video = videoRef.current;
 
-      // ✅ OPTIMIZED: Draw to canvas - throttled updates, only set dimensions when needed
       if (
         shouldUpdateCanvas &&
         canvas &&
@@ -743,7 +863,6 @@ export default function OptimizedFaceLiveness() {
       ) {
         const ctx = canvas.getContext("2d", { alpha: false });
         if (ctx) {
-          // ✅ Only set canvas dimensions if they changed (expensive operation)
           if (
             canvas.width !== video.videoWidth ||
             canvas.height !== video.videoHeight
@@ -752,13 +871,11 @@ export default function OptimizedFaceLiveness() {
             canvas.height = video.videoHeight;
           }
 
-          // ✅ Use video directly instead of results.image (faster, no processing overhead)
           ctx.clearRect(0, 0, canvas.width, canvas.height);
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         }
       }
 
-      // Process gestures based on current step
       const currentStep = step;
       switch (currentStep) {
         case "BLINK":
@@ -775,8 +892,7 @@ export default function OptimizedFaceLiveness() {
           break;
       }
 
-      // Passive Liveness Detection (runs continuously in background)
-      if (currentStep !== "COMPLETE") {
+      if (currentStep !== "COMPLETE" && currentStep !== "CAPTURE_REFERENCE") {
         calculatePassiveLiveness(landmarks);
       }
     },
@@ -839,16 +955,12 @@ export default function OptimizedFaceLiveness() {
           console.error("Camera access error:", cameraErr);
           const error = cameraErr as { name?: string; message?: string };
           if (error.name === "NotAllowedError") {
-            setError(
-              "Camera permission denied. Please allow camera access and refresh."
-            );
+            setError("Camera permission denied. Please allow camera access.");
           } else if (error.name === "NotFoundError") {
-            setError("No camera found. Please connect a camera and refresh.");
+            setError("No camera found. Please connect a camera.");
           } else {
             setError(
-              `Camera error: ${
-                error.message || "Please check your camera permissions."
-              }`
+              `Camera error: ${error.message || "Please check permissions."}`
             );
           }
           return;
@@ -922,7 +1034,7 @@ export default function OptimizedFaceLiveness() {
 
         if (faceMesh) {
           faceMesh.setOptions({
-            maxNumFaces: 3, // ✅ Changed from 1 to 3 to detect multiple faces for error handling
+            maxNumFaces: 3,
             refineLandmarks: true,
             minDetectionConfidence: 0.7,
             minTrackingConfidence: 0.7,
@@ -963,7 +1075,6 @@ export default function OptimizedFaceLiveness() {
               faceMesh &&
               videoRef.current.readyState >= 2
             ) {
-              // ✅ Only process if video is ready (HAVE_CURRENT_DATA or higher)
               await faceMesh.send({ image: videoRef.current });
             }
           },
@@ -974,6 +1085,8 @@ export default function OptimizedFaceLiveness() {
         if (camera) {
           await camera.start();
         }
+
+        setStatus("Ready to start verification");
       } catch (err: unknown) {
         console.error("Error initializing face detection:", err);
         const error = err as { message?: string };
@@ -1009,10 +1122,8 @@ export default function OptimizedFaceLiveness() {
           className={styles.video}
         />
         <canvas ref={canvasRef} className={styles.canvas} />
-
         <canvas ref={captureCanvasRef} style={{ display: "none" }} />
-
-        <div className={styles.photoBadge}>📸 Photos: {capturedCount}/4</div>
+        <div className={styles.photoBadge}>📸 Photos: {capturedCount}/5</div>
       </div>
 
       <div className={styles.content}>
@@ -1022,7 +1133,7 @@ export default function OptimizedFaceLiveness() {
 
         <div className={styles.statusContainer}>
           <p className={styles.status}>{status}</p>
-          {step !== "COMPLETE" && (
+          {step !== "COMPLETE" && step !== "CAPTURE_REFERENCE" && (
             <div className={styles.progressBar}>
               <div
                 className={styles.progressFill}
@@ -1032,15 +1143,95 @@ export default function OptimizedFaceLiveness() {
           )}
         </div>
 
+        {step === "CAPTURE_REFERENCE" && (
+          <div className={styles.captureSection}>
+            <h3>Step 1: Upload Reference Photo</h3>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleReferenceImageUpload}
+              className={styles.fileInput}
+              id="referenceImage"
+              style={{ display: "none" }}
+            />
+            <label htmlFor="referenceImage" className={styles.uploadButton}>
+              📁 Choose Image from Disk
+            </label>
+
+            {uploadedReferenceImage && (
+              <div className={styles.uploadPreview}>
+                <img
+                  src={uploadedReferenceImage}
+                  alt="Reference"
+                  className={styles.previewImage}
+                />
+                <p className={styles.successText}>✅ Reference image loaded!</p>
+                <button
+                  onClick={startVerificationProcess}
+                  className={styles.startButton}
+                >
+                  🚀 Start Verification
+                </button>
+              </div>
+            )}
+
+            <p className={styles.instruction}>
+              Upload a clear photo of your face. This will be compared with live
+              captures.
+            </p>
+          </div>
+        )}
+
         {step === "COMPLETE" && !isSubmitting && (
           <div className={styles.success}>
             <h2>✅ Verification Complete!</h2>
-            <p>All photos captured and submitted</p>
+            <p>All checks completed</p>
             <p className={styles.photoCount}>
-              📸 {capturedCount} photos sent to backend
+              📸 {capturedCount} photos captured
             </p>
 
-            {/* Passive Liveness Result */}
+            {faceComparisonResult && (
+              <div className={styles.comparisonResult}>
+                <h3>Face Comparison Result</h3>
+                <div
+                  className={`${styles.comparisonCard} ${
+                    faceComparisonResult.match ? styles.match : styles.noMatch
+                  }`}
+                >
+                  <div className={styles.comparisonMessage}>
+                    {faceComparisonResult.message}
+                  </div>
+                  <div className={styles.comparisonDetails}>
+                    <div className={styles.detailItem}>
+                      <span className={styles.label}>Similarity:</span>
+                      <span className={styles.value}>
+                        {faceComparisonResult.similarity}%
+                      </span>
+                    </div>
+                    <div className={styles.detailItem}>
+                      <span className={styles.label}>Distance:</span>
+                      <span className={styles.value}>
+                        {faceComparisonResult.distance}
+                      </span>
+                    </div>
+                    <div className={styles.detailItem}>
+                      <span className={styles.label}>Match:</span>
+                      <span className={styles.value}>
+                        {faceComparisonResult.match ? "✅ Yes" : "❌ No"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className={styles.similarityBar}>
+                    <div
+                      className={styles.similarityFill}
+                      style={{ width: `${faceComparisonResult.similarity}%` }}
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {passiveLivenessResult && (
               <div className={styles.livenessResult}>
                 <h3>Passive Liveness Analysis</h3>
@@ -1157,13 +1348,25 @@ export default function OptimizedFaceLiveness() {
         {isSubmitting && (
           <div className={styles.loading}>
             <div className={styles.spinner}></div>
-            <p>Submitting verification data...</p>
+            <p>Processing verification...</p>
           </div>
         )}
 
         <div className={styles.instructions}>
-          <h3>Complete these gestures:</h3>
+          <h3>Steps:</h3>
           <ul>
+            <li
+              className={
+                step === "CAPTURE_REFERENCE"
+                  ? styles.active
+                  : detectionStateRef.current.capturedPhotos.reference
+                  ? styles.completed
+                  : ""
+              }
+            >
+              📁 Upload reference photo{" "}
+              {detectionStateRef.current.capturedPhotos.reference && "✓"}
+            </li>
             <li
               className={
                 step === "BLINK"
@@ -1185,8 +1388,7 @@ export default function OptimizedFaceLiveness() {
                   : ""
               }
             >
-              😊 Smile naturally{" "}
-              {detectionStateRef.current.capturedPhotos.smile && "✓"}
+              😊 Smile {detectionStateRef.current.capturedPhotos.smile && "✓"}
             </li>
             <li
               className={
@@ -1222,7 +1424,9 @@ export default function OptimizedFaceLiveness() {
               {previewPhotos.map((photo, index) => (
                 <div key={index} className={styles.photoItem}>
                   <img src={photo} alt={`Captured ${index + 1}`} />
-                  <span className={styles.photoLabel}>Photo {index + 1}</span>
+                  <span className={styles.photoLabel}>
+                    {index === 0 ? "Reference" : `Photo ${index}`}
+                  </span>
                 </div>
               ))}
             </div>
@@ -1233,7 +1437,7 @@ export default function OptimizedFaceLiveness() {
   );
 }
 
-/* ---------------- Helper Functions ---------------- */
+/* Helper Functions */
 
 function generateSessionId(): string {
   return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
