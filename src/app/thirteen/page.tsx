@@ -46,6 +46,19 @@ interface DetectionState {
   neutralSmileFrames: number;
   lastLandmarks: FaceLandmark[] | null;
   isTransitioning: boolean;
+  audioRecordingStarted: boolean; // Prevent showing number again
+  // 3D Liveness Detection
+  depthVariationScore: number;
+  depthVariationFrames: number;
+  previousDepthValues: number[];
+  liveness3DScore: number;
+  liveness3DDetected: boolean;
+  // Enhanced Detection Properties
+  depthVariationHistory: number[];
+  zeroVariationFrames: number;
+  flatDepthFrames: number;
+  videoDetected: boolean;
+  image2DDetected: boolean;
 }
 
 interface VerificationResult {
@@ -64,6 +77,14 @@ interface VerificationResult {
     validated: boolean;
     spokenNumber?: string;
   };
+  liveness3D: {
+    detected: boolean;
+    score: number;
+    depthVariation: number;
+    confidence: number;
+    videoDetected: boolean;
+    image2DDetected: boolean;
+  };
   timestamp: number;
   duration: number;
 }
@@ -79,9 +100,15 @@ export default function VideoIdentification() {
   const streamRef = useRef<MediaStream | null>(null);
   const stopVideoRecordingRef = useRef<(() => void) | undefined>(undefined);
   const startAudioRecordingRef = useRef<(() => void) | undefined>(undefined);
-  const completeVerificationRef = useRef<(() => Promise<void>) | undefined>(undefined);
-  const sendToBackendRef = useRef<((result: VerificationResult) => Promise<void>) | undefined>(undefined);
-  const startVideoRecordingRef = useRef<((stream: MediaStream) => void) | undefined>(undefined);
+  const completeVerificationRef = useRef<(() => Promise<void>) | undefined>(
+    undefined
+  );
+  const sendToBackendRef = useRef<
+    ((result: VerificationResult) => Promise<void>) | undefined
+  >(undefined);
+  const startVideoRecordingRef = useRef<
+    ((stream: MediaStream) => void) | undefined
+  >(undefined);
 
   const [status, setStatus] = useState("Ready to start video identification");
   const [step, setStep] = useState<VerificationStep>("READY");
@@ -93,6 +120,10 @@ export default function VideoIdentification() {
   const [spokenNumber, setSpokenNumber] = useState<string>("");
   const [numberValidated, setNumberValidated] = useState(false);
   const [previewFrames, setPreviewFrames] = useState<string[]>([]);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const videoPlayerRef = useRef<HTMLVideoElement>(null);
+  const audioPlayerRef = useRef<HTMLAudioElement>(null);
 
   const detectionStateRef = useRef<DetectionState>({
     faceDetected: false,
@@ -115,6 +146,19 @@ export default function VideoIdentification() {
     neutralSmileFrames: 0,
     lastLandmarks: null,
     isTransitioning: false,
+    audioRecordingStarted: false,
+    // 3D Liveness state
+    depthVariationScore: 0,
+    depthVariationFrames: 0,
+    previousDepthValues: [],
+    liveness3DScore: 0,
+    liveness3DDetected: false,
+    // Enhanced Detection state
+    depthVariationHistory: [],
+    zeroVariationFrames: 0,
+    flatDepthFrames: 0,
+    videoDetected: false,
+    image2DDetected: false,
   });
 
   const audioStreamRef = useRef<MediaStream | null>(null);
@@ -156,6 +200,284 @@ export default function VideoIdentification() {
     return noseOffset / (faceWidth + 0.001);
   }, []);
 
+  // Efficient 3D Liveness Detection Function with Enhanced 2D/Video Detection
+  const calculate3DLiveness = useCallback(
+    (landmarks: FaceLandmark[]): {
+      detected: boolean;
+      score: number;
+      depthVariation: number;
+      confidence: number;
+      videoDetected: boolean;
+      image2DDetected: boolean;
+    } => {
+      const state = detectionStateRef.current;
+
+      // Key face points for depth measurement (strategically selected)
+      const depthCheckPoints = [
+        1,    // Forehead center
+        33,   // Nose tip
+        61,   // Left eye corner
+        199,  // Right eye corner
+        263,  // Left cheek
+        291,  // Right cheek
+        10,   // Upper forehead
+        152,  // Chin center
+      ];
+
+      // Calculate current depth values
+      const currentDepths: number[] = [];
+      let validPoints = 0;
+
+      for (const idx of depthCheckPoints) {
+        const landmark = landmarks[idx];
+        if (landmark && landmark.z !== undefined && landmark.z !== null) {
+          currentDepths.push(landmark.z);
+          validPoints++;
+        }
+      }
+
+      // Need at least 4 valid points for reliable measurement
+      if (validPoints < 4) {
+        return {
+          detected: false,
+          score: 0,
+          depthVariation: 0,
+          confidence: 0,
+          videoDetected: false,
+          image2DDetected: false,
+        };
+      }
+
+      // Calculate depth variation if we have previous values
+      let depthVariation = 0;
+      if (state.previousDepthValues.length > 0) {
+        let totalVariation = 0;
+        const minLength = Math.min(
+          currentDepths.length,
+          state.previousDepthValues.length
+        );
+
+        for (let i = 0; i < minLength; i++) {
+          const variation = Math.abs(
+            currentDepths[i] - state.previousDepthValues[i]
+          );
+          totalVariation += variation;
+        }
+
+        depthVariation = totalVariation / minLength;
+        state.depthVariationScore += depthVariation;
+        state.depthVariationFrames++;
+
+        // ✅ Store depth variation history for pattern analysis
+        state.depthVariationHistory.push(depthVariation);
+        if (state.depthVariationHistory.length > 20) {
+          state.depthVariationHistory.shift(); // Keep last 20 values
+        }
+
+        // ✅ IMPROVEMENT 1: Enhanced 2D Image Detection
+        // Check 1: Zero or very low depth variation (static photo)
+        if (depthVariation < 0.005) {
+          // More strict threshold - only truly zero variation
+          state.zeroVariationFrames++;
+        } else {
+          // If there's any movement, decrease counter faster
+          state.zeroVariationFrames = Math.max(0, state.zeroVariationFrames - 2);
+          // If significant movement detected, reset 2D detection
+          if (depthVariation > 0.05 && state.image2DDetected) {
+            state.image2DDetected = false; // Real movement detected, not 2D
+          }
+        }
+      }
+
+      // Store current depths for next frame (synchronized update)
+      state.previousDepthValues = [...currentDepths];
+
+      // Calculate depth consistency (variance in current frame)
+      const meanDepth =
+        currentDepths.reduce((sum, d) => sum + d, 0) / currentDepths.length;
+      const variance =
+        currentDepths.reduce(
+          (sum, d) => sum + Math.pow(d - meanDepth, 2),
+          0
+        ) / currentDepths.length;
+      const depthConsistency = Math.sqrt(variance);
+
+      // ✅ IMPROVEMENT 2: Check for flat depth structure (2D image characteristic)
+      const depthRange = Math.max(...currentDepths) - Math.min(...currentDepths);
+      if (depthRange < 0.03) {
+        // More strict threshold - only very flat structures
+        state.flatDepthFrames++;
+      } else {
+        state.flatDepthFrames = Math.max(0, state.flatDepthFrames - 2); // Decrease faster
+      }
+
+      // ✅ IMPROVEMENT 3-5: Enhanced 2D Detection - Require MULTIPLE conditions
+      // Only flag as 2D if ALL of these are true simultaneously:
+      // 1. Very low depth consistency (extremely flat)
+      // 2. Very narrow depth range (no 3D structure)
+      // 3. Zero or near-zero variation for extended period
+      // 4. Enough frames analyzed (at least 20 frames)
+      // 5. No significant movement detected overall
+
+      const hasVeryLowConsistency = depthConsistency < 0.003; // More strict (was 0.005)
+      const hasVeryNarrowRange = depthRange < 0.02; // More strict (was 0.03)
+      const hasExtendedZeroVariation = state.zeroVariationFrames > 20; // More frames required (was 10)
+      const hasExtendedFlatStructure = state.flatDepthFrames > 20; // More frames required (was 10)
+      const hasEnoughAnalysisFrames = state.depthVariationFrames >= 20; // Need more data
+      const hasNoSignificantMovement = state.depthVariationScore < 0.1; // Overall very low movement
+
+      // Only flag as 2D if MULTIPLE strong indicators are present
+      // This prevents false positives on real faces that are temporarily still
+      if (
+        hasEnoughAnalysisFrames &&
+        hasNoSignificantMovement &&
+        (
+          // Option 1: Very flat structure + zero variation
+          (hasVeryLowConsistency && hasVeryNarrowRange && hasExtendedZeroVariation) ||
+          // Option 2: Extended flat structure + extended zero variation
+          (hasExtendedFlatStructure && hasExtendedZeroVariation && hasVeryNarrowRange)
+        )
+      ) {
+        state.image2DDetected = true;
+      }
+
+      // ✅ IMPROVEMENT 6: Video Playback Detection - Movement Pattern Analysis
+      // Only flag as video if MULTIPLE strong indicators are present
+      // This prevents false positives on real faces with smooth movement
+      
+      let videoIndicators = 0; // Count how many indicators suggest video
+      const minFramesForVideoCheck = 25; // Need more frames to be confident
+      
+      if (state.depthVariationHistory.length >= 15) {
+        const recentVariations = state.depthVariationHistory.slice(-15);
+        const mean = recentVariations.reduce((a, b) => a + b, 0) / recentVariations.length;
+        const variance = recentVariations.reduce(
+          (sum, v) => sum + Math.pow(v - mean, 2),
+          0
+        ) / recentVariations.length;
+        const stdDev = Math.sqrt(variance);
+
+        // Video has EXTREMELY predictable patterns (very low standard deviation)
+        // Real faces can have low std dev when moving smoothly, so make threshold stricter
+        if (stdDev < 0.015 && state.depthVariationFrames > minFramesForVideoCheck) {
+          videoIndicators++;
+        }
+
+        // Video has uniform variation (very small range but consistent)
+        const maxVar = Math.max(...recentVariations);
+        const minVar = Math.min(...recentVariations);
+        const variationRange = maxVar - minVar;
+
+        // More strict: require very small range AND consistent mean
+        if (variationRange < 0.05 && mean > 0.03 && state.depthVariationFrames > minFramesForVideoCheck) {
+          videoIndicators++;
+        }
+        
+        // Check for unnatural uniformity - all variations very similar
+        const allSimilar = recentVariations.every(v => Math.abs(v - mean) < 0.01);
+        if (allSimilar && state.depthVariationFrames > minFramesForVideoCheck) {
+          videoIndicators++;
+        }
+      }
+
+      // ✅ IMPROVEMENT 7: Frame-to-Frame Consistency Check (Video characteristic)
+      if (state.previousDepthValues.length > 0 && currentDepths.length > 0) {
+        let totalDiff = 0;
+        const minLen = Math.min(currentDepths.length, state.previousDepthValues.length);
+        for (let i = 0; i < minLen; i++) {
+          totalDiff += Math.abs(currentDepths[i] - state.previousDepthValues[i]);
+        }
+        const avgDiff = totalDiff / minLen;
+
+        // EXTREMELY low difference = high consistency (video characteristic)
+        // Real faces have more natural variation, even when still
+        // Make threshold much stricter
+        if (avgDiff < 0.005 && state.depthVariationFrames > minFramesForVideoCheck) {
+          videoIndicators++;
+        }
+      }
+      
+      // Only flag as video if MULTIPLE indicators AND enough frames analyzed
+      // Also check that there's no natural variation that would indicate real face
+      const hasNaturalVariation = state.depthVariationScore > 0.2 || depthVariation > 0.03;
+      const hasEnoughFramesForVideo = state.depthVariationFrames >= minFramesForVideoCheck;
+      
+      // Require at least 2-3 indicators to be confident it's video
+      // AND no significant natural variation detected
+      if (hasEnoughFramesForVideo && videoIndicators >= 2 && !hasNaturalVariation) {
+        state.videoDetected = true;
+      } else if (hasNaturalVariation && state.videoDetected) {
+        // If natural variation detected, reset video detection
+        state.videoDetected = false;
+      }
+
+      // Accumulate depth variation score (reset if too high to prevent stale data)
+      if (state.depthVariationScore > 5.0) {
+        state.depthVariationScore = 0.5; // Reset to baseline
+      }
+
+      // Calculate 3D liveness score (0-100)
+      // Real face should have:
+      // 1. Depth variation > threshold (movement detected)
+      // 2. Consistent depth structure (not flat like photo)
+      // 3. Multiple frames with variation
+
+      const hasDepthVariation = state.depthVariationScore > 0.15;
+      const hasConsistentStructure = depthConsistency > 0.01 && depthConsistency < 0.3;
+      const hasEnoughFrames = state.depthVariationFrames >= 5;
+
+      let score = 0;
+      if (hasDepthVariation) score += 40;
+      if (hasConsistentStructure) score += 30;
+      if (hasEnoughFrames) score += 30;
+
+      // ✅ Apply penalties for detected spoofs
+      // Only apply penalty if we're very confident it's a spoof
+      // Check if there's any movement that suggests it's real
+      const hasAnyRealMovement = state.depthVariationScore > 0.1 || depthVariation > 0.02;
+      
+      if (state.image2DDetected && !hasAnyRealMovement) {
+        // Only penalize if no real movement detected
+        score = Math.max(0, score - 60); // Heavy penalty for 2D image
+      } else if (state.image2DDetected && hasAnyRealMovement) {
+        // If 2D detected but movement found, might be false positive - reset it
+        state.image2DDetected = false;
+      }
+      
+      if (state.videoDetected) {
+        score = Math.max(0, score - 50); // Heavy penalty for video playback
+      }
+
+      // Confidence based on consistency and frame count
+      const confidence = Math.min(
+        100,
+        (state.depthVariationFrames / 10) * 50 + (hasConsistentStructure ? 50 : 0)
+      );
+
+      // ✅ Final detection must pass all checks and not be spoofed
+      const detected =
+        score >= 60 &&
+        hasDepthVariation &&
+        hasEnoughFrames &&
+        !state.image2DDetected &&
+        !state.videoDetected;
+
+      // Update state
+      state.liveness3DScore = score;
+      state.liveness3DDetected = detected;
+
+      return {
+        detected,
+        score: Math.round(score),
+        depthVariation: Math.round(state.depthVariationScore * 1000) / 1000,
+        confidence: Math.round(confidence),
+        videoDetected: state.videoDetected,
+        image2DDetected: state.image2DDetected,
+      };
+    },
+    []
+  );
+
   // Helper function: Get mouth metrics
   const getMouthMetrics = useCallback((landmarks: FaceLandmark[]) => {
     const topLip = landmarks[13];
@@ -194,14 +516,22 @@ export default function VideoIdentification() {
     const video = videoRef.current;
     const canvas = canvasRef.current;
 
-    if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) {
+    if (
+      !video ||
+      !canvas ||
+      video.videoWidth === 0 ||
+      video.videoHeight === 0
+    ) {
       return null;
     }
 
     const ctx = canvas.getContext("2d", { alpha: false });
     if (!ctx) return null;
 
-    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+    if (
+      canvas.width !== video.videoWidth ||
+      canvas.height !== video.videoHeight
+    ) {
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
     }
@@ -209,13 +539,7 @@ export default function VideoIdentification() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.save();
     ctx.scale(-1, 1);
-    ctx.drawImage(
-      video,
-      -canvas.width,
-      0,
-      canvas.width,
-      canvas.height
-    );
+    ctx.drawImage(video, -canvas.width, 0, canvas.width, canvas.height);
     ctx.restore();
 
     return canvas.toDataURL("image/jpeg", 0.8);
@@ -306,7 +630,9 @@ export default function VideoIdentification() {
               (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
               90
             );
-            setStatus(`Turn your head more left... (${Math.round(progress)}%) 👈`);
+            setStatus(
+              `Turn your head more left... (${Math.round(progress)}%) 👈`
+            );
           }
 
           if (
@@ -349,7 +675,9 @@ export default function VideoIdentification() {
               (state.headTurnConsecutiveFrames / MIN_CONSECUTIVE_FRAMES) * 100,
               90
             );
-            setStatus(`Turn your head more right... (${Math.round(progress)}%) 👉`);
+            setStatus(
+              `Turn your head more right... (${Math.round(progress)}%) 👉`
+            );
           }
 
           if (
@@ -371,11 +699,21 @@ export default function VideoIdentification() {
             }
 
             setStatus("Right turn detected! ✓");
-            // All gestures complete - show random number
+            // All gestures complete - show random number, then start audio
+            // Video continues recording
             setTimeout(() => {
               setStep("SHOW_NUMBER");
-              setStatus(`All gestures complete! Now read this number: ${randomNumber}`);
-              // Video continues recording for remaining time (30 seconds total)
+              setStatus(
+                `All gestures complete! Now read this number: ${randomNumber}`
+              );
+
+              // Show number for 3 seconds, then start audio recording
+              // Video continues recording during audio too
+              setTimeout(() => {
+                if (startAudioRecordingRef.current) {
+                  startAudioRecordingRef.current();
+                }
+              }, 3000);
             }, 500);
           }
         } else if (headPose < NEUTRAL_THRESHOLD) {
@@ -421,9 +759,7 @@ export default function VideoIdentification() {
 
       // Smile detection criteria
       const isSmile =
-        widthIncrease > 0.12 &&
-        mouthOpen > 0.006 &&
-        mouthOpen < 0.08;
+        widthIncrease > 0.12 && mouthOpen > 0.006 && mouthOpen < 0.08;
 
       if (isSmile) {
         state.smileConsecutiveFrames++;
@@ -519,7 +855,7 @@ export default function VideoIdentification() {
       // Generate random 5-digit number (will show after gestures)
       const number = generateRandomNumber();
       setRandomNumber(number);
-      
+
       // Start directly with video recording (30 seconds total)
       setStatus("Position your face in the frame");
       if (startVideoRecordingRef.current) {
@@ -539,68 +875,79 @@ export default function VideoIdentification() {
   }, [generateRandomNumber]);
 
   // Start video recording
-  const startVideoRecording = useCallback(
-    (stream: MediaStream) => {
-      try {
-        const videoTrack = stream.getVideoTracks()[0];
-        const videoStream = new MediaStream([videoTrack]);
+  const startVideoRecording = useCallback((stream: MediaStream) => {
+    try {
+      const videoTrack = stream.getVideoTracks()[0];
+      const videoStream = new MediaStream([videoTrack]);
 
-        const mediaRecorder = new MediaRecorder(videoStream, {
-          mimeType: "video/webm;codecs=vp8",
-        });
+      const mediaRecorder = new MediaRecorder(videoStream, {
+        mimeType: "video/webm;codecs=vp8",
+      });
 
-        videoChunksRef.current = [];
+      videoChunksRef.current = [];
 
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            videoChunksRef.current.push(event.data);
-          }
-        };
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          videoChunksRef.current.push(event.data);
+        }
+      };
 
-        mediaRecorder.onstop = () => {
-          console.log("✅ Video recording stopped");
-        };
+      mediaRecorder.onstop = () => {
+        console.log("✅ Video recording stopped");
+      };
 
-        mediaRecorderRef.current = mediaRecorder;
-        mediaRecorder.start(100); // Collect data every 100ms for better quality
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start(100); // Collect data every 100ms for better quality
 
-        detectionStateRef.current.startTime = Date.now();
+      detectionStateRef.current.startTime = Date.now();
         detectionStateRef.current.videoFrames = []; // Reset frames array
         setPreviewFrames([]); // Reset preview frames
         
-        // Start with blink detection during video recording
-        setStep("BLINK");
-        setStatus("Recording video... Please blink your eyes 👁️");
+        // Reset 3D liveness state
+        detectionStateRef.current.depthVariationScore = 0;
+        detectionStateRef.current.depthVariationFrames = 0;
+        detectionStateRef.current.previousDepthValues = [];
+        detectionStateRef.current.liveness3DScore = 0;
+        detectionStateRef.current.liveness3DDetected = false;
+        // Reset enhanced detection state
+        detectionStateRef.current.depthVariationHistory = [];
+        detectionStateRef.current.zeroVariationFrames = 0;
+        detectionStateRef.current.flatDepthFrames = 0;
+        detectionStateRef.current.videoDetected = false;
+        detectionStateRef.current.image2DDetected = false;
 
-        // Record for 30 seconds total
-        setTimeout(() => {
-          if (stopVideoRecordingRef.current) {
-            stopVideoRecordingRef.current();
-          }
-        }, 30000);
-      } catch (err) {
-        console.error("Error starting video recording:", err);
-        setError("Failed to start video recording");
-      }
-    },
-    []
-  );
+      // Start with blink detection during video recording
+      setStep("BLINK");
+      setStatus("Recording video... Please blink your eyes 👁️");
+
+      // Video will continue recording until audio recording stops
+      // No timeout - video records until the end
+    } catch (err) {
+      console.error("Error starting video recording:", err);
+      setError("Failed to start video recording");
+    }
+  }, []);
 
   // Store ref for startVideoRecording
   useEffect(() => {
     startVideoRecordingRef.current = startVideoRecording;
   }, [startVideoRecording]);
 
-  // Stop video recording and start audio recording
+  // Stop video recording
   const stopVideoRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
       mediaRecorderRef.current.stop();
     }
 
     // Filter out undefined frames
-    const frames = detectionStateRef.current.videoFrames.filter(f => f !== undefined);
+    const frames = detectionStateRef.current.videoFrames.filter(
+      (f) => f !== undefined
+    );
     detectionStateRef.current.videoFrames = frames;
-    
+
     console.log(`📸 Total frames captured: ${frames.length}/4`);
     console.log("📸 Frame breakdown:", {
       blink: frames[0] ? "✅" : "❌",
@@ -608,21 +955,8 @@ export default function VideoIdentification() {
       turnLeft: frames[2] ? "✅" : "❌",
       turnRight: frames[3] ? "✅" : "❌",
     });
-
-    // If we're already showing number, start audio recording
-    if (step === "SHOW_NUMBER") {
-      setStatus("Video recorded! Now please read the number aloud...");
-      setTimeout(() => {
-        if (startAudioRecordingRef.current) {
-          startAudioRecordingRef.current();
-        }
-      }, 1000);
-    } else {
-      // Show number first, then audio will start
-      setStep("SHOW_NUMBER");
-      setStatus(`All gestures complete! Now read this number: ${randomNumber}`);
-    }
-  }, [step, randomNumber]);
+    console.log("✅ Video recording stopped (recorded until audio end)");
+  }, []);
 
   // Store ref for stopVideoRecording
   useEffect(() => {
@@ -674,10 +1008,24 @@ export default function VideoIdentification() {
       audioRecorder.onstop = () => {
         console.log("✅ Audio recording stopped");
         console.log(`🎤 Total audio chunks: ${audioChunksRef.current.length}`);
-        console.log(`🎤 Total audio size: ${audioChunksRef.current.reduce((sum, chunk) => sum + chunk.size, 0)} bytes`);
-        if (completeVerificationRef.current) {
-          completeVerificationRef.current();
+        console.log(
+          `🎤 Total audio size: ${audioChunksRef.current.reduce(
+            (sum, chunk) => sum + chunk.size,
+            0
+          )} bytes`
+        );
+
+        // Stop video recording when audio stops (video recorded until the end)
+        if (stopVideoRecordingRef.current) {
+          stopVideoRecordingRef.current();
         }
+
+        // Then complete verification
+        setTimeout(() => {
+          if (completeVerificationRef.current) {
+            completeVerificationRef.current();
+          }
+        }, 500);
       };
 
       audioRecorder.onerror = (event) => {
@@ -688,14 +1036,22 @@ export default function VideoIdentification() {
       audioRecorderRef.current = audioRecorder;
       audioRecorder.start(100); // Collect data every 100ms for better quality
 
+      // Mark audio recording as started to prevent showing number again
+      detectionStateRef.current.audioRecordingStarted = true;
+
       setStep("RECORDING_AUDIO");
       setStatus(`Recording audio... Please read or spell: ${randomNumber}`);
 
       // Initialize Web Speech API for number validation
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const SpeechRecognitionWindow = window as any;
-      if (SpeechRecognitionWindow.webkitSpeechRecognition || SpeechRecognitionWindow.SpeechRecognition) {
-        const SpeechRecognition = SpeechRecognitionWindow.webkitSpeechRecognition || SpeechRecognitionWindow.SpeechRecognition;
+      if (
+        SpeechRecognitionWindow.webkitSpeechRecognition ||
+        SpeechRecognitionWindow.SpeechRecognition
+      ) {
+        const SpeechRecognition =
+          SpeechRecognitionWindow.webkitSpeechRecognition ||
+          SpeechRecognitionWindow.SpeechRecognition;
         if (SpeechRecognition) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const recognition = new SpeechRecognition() as any;
@@ -703,7 +1059,10 @@ export default function VideoIdentification() {
           recognition.interimResults = false;
           recognition.lang = "en-US";
 
-          recognition.onresult = (event: { resultIndex: number; results: Array<Array<{ transcript: string }>> }) => {
+          recognition.onresult = (event: {
+            resultIndex: number;
+            results: Array<Array<{ transcript: string }>>;
+          }) => {
             let transcript = "";
             for (let i = event.resultIndex; i < event.results.length; i++) {
               transcript += event.results[i][0].transcript;
@@ -717,13 +1076,23 @@ export default function VideoIdentification() {
                 setNumberValidated(true);
                 setStatus(`✅ Number validated! You said: ${numbers}`);
               } else {
-                setStatus(`⚠️ Number mismatch. Expected: ${randomNumber}, Heard: ${numbers}`);
+                setStatus(
+                  `⚠️ Number mismatch. Expected: ${randomNumber}, Heard: ${numbers}`
+                );
               }
             }
           };
 
           recognition.onerror = (event: { error: string }) => {
             console.error("Speech recognition error:", event.error);
+            // Don't show error to user if it's just a no-speech or aborted error
+            if (event.error !== "no-speech" && event.error !== "aborted") {
+              // Only show critical errors
+              if (event.error === "network" || event.error === "not-allowed") {
+                setError(`Speech recognition error: ${event.error}`);
+              }
+            }
+            // Don't reset step or show number again on error - keep recording
           };
 
           recognitionRef.current = recognition;
@@ -735,7 +1104,10 @@ export default function VideoIdentification() {
 
       // Record audio for 8 seconds (longer for spelling)
       setTimeout(() => {
-        if (audioRecorderRef.current && audioRecorderRef.current.state !== "inactive") {
+        if (
+          audioRecorderRef.current &&
+          audioRecorderRef.current.state !== "inactive"
+        ) {
           audioRecorderRef.current.stop();
         }
         if (recognitionRef.current) {
@@ -744,7 +1116,11 @@ export default function VideoIdentification() {
       }, 8000);
     } catch (err) {
       console.error("Error starting audio recording:", err);
-      setError(`Failed to start audio recording: ${err instanceof Error ? err.message : "Unknown error"}`);
+      setError(
+        `Failed to start audio recording: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
     }
   }, [randomNumber]);
 
@@ -757,7 +1133,9 @@ export default function VideoIdentification() {
   const completeVerification = useCallback(async () => {
     setIsProcessing(true);
     setStep("PROCESSING");
-    setStatus("Processing verification data... Extracting frames from video...");
+    setStatus(
+      "Processing verification data... Extracting frames from video..."
+    );
 
     try {
       const state = detectionStateRef.current;
@@ -778,9 +1156,22 @@ export default function VideoIdentification() {
       // Get frames captured during video recording
       const detectionState = detectionStateRef.current;
       const videoFrames = detectionState.videoFrames || [];
-      console.log(`📸 Using ${videoFrames.length} frames captured during recording`);
+      console.log(
+        `📸 Using ${videoFrames.length} frames captured during recording`
+      );
+      // Get final 3D liveness result
+      const liveness3DResult = calculate3DLiveness(
+        detectionState.lastLandmarks || []
+      );
+
       const result: VerificationResult = {
-        success: numberValidated && detectionState.blinkDetected && detectionState.smileDetected && detectionState.headTurnLeft && detectionState.headTurnRight,
+        success:
+          numberValidated &&
+          detectionState.blinkDetected &&
+          detectionState.smileDetected &&
+          detectionState.headTurnLeft &&
+          detectionState.headTurnRight &&
+          liveness3DResult.detected, // ✅ Include 3D liveness in success check
         randomNumber,
         videoBlob,
         audioBlob,
@@ -794,6 +1185,14 @@ export default function VideoIdentification() {
         numberValidation: {
           validated: numberValidated,
           spokenNumber: spokenNumber || undefined,
+        },
+        liveness3D: {
+          detected: liveness3DResult.detected,
+          score: liveness3DResult.score,
+          depthVariation: liveness3DResult.depthVariation,
+          confidence: liveness3DResult.confidence,
+          videoDetected: liveness3DResult.videoDetected,
+          image2DDetected: liveness3DResult.image2DDetected,
         },
         timestamp: Date.now(),
         duration,
@@ -810,6 +1209,16 @@ export default function VideoIdentification() {
       setStep("COMPLETE");
       setStatus("✅ Verification complete!");
 
+      // Create URLs for video and audio playback
+      if (videoBlob) {
+        const url = URL.createObjectURL(videoBlob);
+        setVideoUrl(url);
+      }
+      if (audioBlob) {
+        const url = URL.createObjectURL(audioBlob);
+        setAudioUrl(url);
+      }
+
       // Send to backend (non-blocking)
       if (sendToBackendRef.current) {
         sendToBackendRef.current(result).catch((err) => {
@@ -818,19 +1227,25 @@ export default function VideoIdentification() {
       }
     } catch (err) {
       console.error("Error completing verification:", err);
-      setError(`Error processing verification: ${err instanceof Error ? err.message : "Unknown error"}`);
-      
+      setError(
+        `Error processing verification: ${
+          err instanceof Error ? err.message : "Unknown error"
+        }`
+      );
+
       // Still show result even if there's an error
       const errorDetectionState = detectionStateRef.current;
       const errorResult: VerificationResult = {
         success: false,
         randomNumber: randomNumber || "N/A",
-        videoBlob: videoChunksRef.current.length > 0
-          ? new Blob(videoChunksRef.current, { type: "video/webm" })
-          : null,
-        audioBlob: audioChunksRef.current.length > 0
-          ? new Blob(audioChunksRef.current, { type: "audio/webm" })
-          : null,
+        videoBlob:
+          videoChunksRef.current.length > 0
+            ? new Blob(videoChunksRef.current, { type: "video/webm" })
+            : null,
+        audioBlob:
+          audioChunksRef.current.length > 0
+            ? new Blob(audioChunksRef.current, { type: "audio/webm" })
+            : null,
         videoFrames: [],
         gestures: {
           blinkDetected: errorDetectionState.blinkDetected,
@@ -842,6 +1257,14 @@ export default function VideoIdentification() {
           validated: numberValidated,
           spokenNumber: spokenNumber || undefined,
         },
+        liveness3D: {
+          detected: false,
+          score: 0,
+          depthVariation: 0,
+          confidence: 0,
+          videoDetected: false,
+          image2DDetected: false,
+        },
         timestamp: Date.now(),
         duration: Date.now() - detectionStateRef.current.startTime,
       };
@@ -851,7 +1274,7 @@ export default function VideoIdentification() {
     } finally {
       setIsProcessing(false);
     }
-  }, [randomNumber, numberValidated, spokenNumber]);
+  }, [randomNumber, numberValidated, spokenNumber, calculate3DLiveness]);
 
   // Store ref for completeVerification
   useEffect(() => {
@@ -931,7 +1354,9 @@ export default function VideoIdentification() {
       if (!results.multiFaceLandmarks?.length) {
         state.noFaceFrames++;
         if (state.noFaceFrames > 10) {
-          setError("⚠️ No face detected. Please position your face in the frame");
+          setError(
+            "⚠️ No face detected. Please position your face in the frame"
+          );
         }
         return;
       }
@@ -978,7 +1403,7 @@ export default function VideoIdentification() {
       }
 
       const landmarks = results.multiFaceLandmarks[0] as FaceLandmark[];
-      
+
       // Handle gesture detection during video recording
       const currentStep = step;
       if (currentStep === "BLINK") {
@@ -991,13 +1416,32 @@ export default function VideoIdentification() {
         handleHeadTurnDetection(landmarks, "right");
       }
 
+      // ✅ Efficient 3D Liveness Detection (runs continuously during recording)
+      // Only check during active recording steps (not READY or COMPLETE)
+      if (
+        currentStep !== "READY" &&
+        currentStep !== "COMPLETE" &&
+        currentStep !== "PROCESSING"
+      ) {
+        // Calculate 3D liveness every 2 frames for efficiency
+        if (state.frameCount % 2 === 0) {
+          calculate3DLiveness(landmarks);
+        }
+      }
+
       // Store landmarks for next frame comparison
       if (state.frameCount % 5 === 0) {
         state.lastLandmarks = landmarks.map((l: FaceLandmark) => ({ ...l }));
       }
       state.frameCount++;
     },
-    [step, handleBlinkDetection, handleSmileDetection, handleHeadTurnDetection]
+    [
+      step,
+      handleBlinkDetection,
+      handleSmileDetection,
+      handleHeadTurnDetection,
+      calculate3DLiveness,
+    ]
   );
 
   // Initialize MediaPipe
@@ -1151,6 +1595,18 @@ export default function VideoIdentification() {
     };
   }, []);
 
+  // Cleanup video and audio URLs on unmount
+  useEffect(() => {
+    return () => {
+      if (videoUrl) {
+        URL.revokeObjectURL(videoUrl);
+      }
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+      }
+    };
+  }, [videoUrl, audioUrl]);
+
   return (
     <div className={styles.container}>
       <div className={styles.videoContainer}>
@@ -1164,9 +1620,13 @@ export default function VideoIdentification() {
         <canvas ref={canvasRef} className={styles.canvas} />
 
         {/* Frame Badge */}
-        {(step === "BLINK" || step === "SMILE" || step === "TURN_LEFT" || step === "TURN_RIGHT" || step === "SHOW_NUMBER") && (
+        {(step === "BLINK" ||
+          step === "SMILE" ||
+          step === "TURN_LEFT" ||
+          step === "TURN_RIGHT" ||
+          step === "SHOW_NUMBER") && (
           <div className={styles.frameBadge}>
-            📸 Frames: {previewFrames.filter(f => f).length}/4
+            📸 Frames: {previewFrames.filter((f) => f).length}/4
           </div>
         )}
 
@@ -1179,7 +1639,12 @@ export default function VideoIdentification() {
         )}
 
         {/* Recording Indicator */}
-        {(step === "RECORDING_AUDIO" || step === "BLINK" || step === "SMILE" || step === "TURN_LEFT" || step === "TURN_RIGHT" || step === "SHOW_NUMBER") && (
+        {(step === "RECORDING_AUDIO" ||
+          step === "BLINK" ||
+          step === "SMILE" ||
+          step === "TURN_LEFT" ||
+          step === "TURN_RIGHT" ||
+          step === "SHOW_NUMBER") && (
           <div className={styles.recordingIndicator}>
             <span className={styles.recordingDot}></span>
             {step === "BLINK" && "Recording Video - Blink"}
@@ -1203,14 +1668,16 @@ export default function VideoIdentification() {
 
         {step === "READY" && (
           <div className={styles.readySection}>
-              <p className={styles.instruction}>
-                This process will:
-                <br />• Record a 30-second video with gestures (blink, smile, turn left, turn right)
-                <br />• Show you a random 5-digit number after gestures
-                <br />• Record your voice spelling the number
-                <br />• Validate the number on frontend
-                <br />• Send 4 pictures, full video, audio, and verification status to backend
-              </p>
+            <p className={styles.instruction}>
+              This process will:
+              <br />• Record a 30-second video with gestures (blink, smile, turn
+              left, turn right)
+              <br />• Show you a random 5-digit number after gestures
+              <br />• Record your voice spelling the number
+              <br />• Validate the number on frontend
+              <br />• Send 4 pictures, full video, audio, and verification
+              status to backend
+            </p>
             <button
               onClick={startIdentification}
               className={styles.startButton}
@@ -1226,112 +1693,269 @@ export default function VideoIdentification() {
               <>
                 <h2>✅ Verification Complete!</h2>
 
-            {/* Verification Summary */}
-            <div className={styles.verificationSummary}>
-              <h3>📊 Verification Summary</h3>
-              <div className={styles.summaryGrid}>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Random Number:</span>
-                  <span className={styles.summaryValue} style={{ fontSize: '24px', fontWeight: '700', color: '#667eea', letterSpacing: '4px' }}>
-                    {verificationResult.randomNumber}
-                  </span>
-                </div>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Video Frames:</span>
-                  <span className={styles.summaryValue}>
-                    {verificationResult.videoFrames.length}
-                  </span>
-                </div>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Video Size:</span>
-                  <span className={styles.summaryValue}>
-                    {verificationResult.videoBlob
-                      ? `${(verificationResult.videoBlob.size / 1024 / 1024).toFixed(2)} MB`
-                      : "N/A"}
-                  </span>
-                </div>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Audio Size:</span>
-                  <span className={styles.summaryValue}>
-                    {verificationResult.audioBlob
-                      ? `${(verificationResult.audioBlob.size / 1024).toFixed(2)} KB`
-                      : "N/A"}
-                  </span>
-                </div>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Duration:</span>
-                  <span className={styles.summaryValue}>
-                    {(verificationResult.duration / 1000).toFixed(1)}s
-                  </span>
-                </div>
-                <div className={styles.summaryItem}>
-                  <span className={styles.summaryLabel}>Overall Result:</span>
-                  <span
-                    className={
-                      verificationResult.success
-                        ? styles.statusPass
-                        : styles.statusFail
-                    }
-                  >
-                    {verificationResult.success ? "✅ VERIFIED" : "❌ NOT VERIFIED"}
-                  </span>
-                </div>
-              </div>
-              
-              {/* Gesture Status */}
-              <div className={styles.gestureStatus}>
-                <h4>Gesture Status:</h4>
-                <div className={styles.gestureList}>
-                  <div className={styles.gestureItem}>
-                    <span className={verificationResult.gestures.blinkDetected ? styles.gesturePass : styles.gestureFail}>
-                      {verificationResult.gestures.blinkDetected ? "✅" : "❌"}
-                    </span>
-                    <span>Blink Detected</span>
+                {/* Verification Summary */}
+                <div className={styles.verificationSummary}>
+                  <h3>📊 Verification Summary</h3>
+                  <div className={styles.summaryGrid}>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>
+                        Random Number:
+                      </span>
+                      <span
+                        className={styles.summaryValue}
+                        style={{
+                          fontSize: "24px",
+                          fontWeight: "700",
+                          color: "#667eea",
+                          letterSpacing: "4px",
+                        }}
+                      >
+                        {verificationResult.randomNumber}
+                      </span>
+                    </div>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>Video Frames:</span>
+                      <span className={styles.summaryValue}>
+                        {verificationResult.videoFrames.length}
+                      </span>
+                    </div>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>Video Size:</span>
+                      <span className={styles.summaryValue}>
+                        {verificationResult.videoBlob
+                          ? `${(
+                              verificationResult.videoBlob.size /
+                              1024 /
+                              1024
+                            ).toFixed(2)} MB`
+                          : "N/A"}
+                      </span>
+                    </div>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>Audio Size:</span>
+                      <span className={styles.summaryValue}>
+                        {verificationResult.audioBlob
+                          ? `${(
+                              verificationResult.audioBlob.size / 1024
+                            ).toFixed(2)} KB`
+                          : "N/A"}
+                      </span>
+                    </div>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>Duration:</span>
+                      <span className={styles.summaryValue}>
+                        {(verificationResult.duration / 1000).toFixed(1)}s
+                      </span>
+                    </div>
+                    <div className={styles.summaryItem}>
+                      <span className={styles.summaryLabel}>
+                        Overall Result:
+                      </span>
+                      <span
+                        className={
+                          verificationResult.success
+                            ? styles.statusPass
+                            : styles.statusFail
+                        }
+                      >
+                        {verificationResult.success
+                          ? "✅ VERIFIED"
+                          : "❌ NOT VERIFIED"}
+                      </span>
+                    </div>
                   </div>
-                  <div className={styles.gestureItem}>
-                    <span className={verificationResult.gestures.smileDetected ? styles.gesturePass : styles.gestureFail}>
-                      {verificationResult.gestures.smileDetected ? "✅" : "❌"}
-                    </span>
-                    <span>Smile Detected</span>
-                  </div>
-                  <div className={styles.gestureItem}>
-                    <span className={verificationResult.gestures.headTurnLeft ? styles.gesturePass : styles.gestureFail}>
-                      {verificationResult.gestures.headTurnLeft ? "✅" : "❌"}
-                    </span>
-                    <span>Head Turn Left</span>
-                  </div>
-                  <div className={styles.gestureItem}>
-                    <span className={verificationResult.gestures.headTurnRight ? styles.gesturePass : styles.gestureFail}>
-                      {verificationResult.gestures.headTurnRight ? "✅" : "❌"}
-                    </span>
-                    <span>Head Turn Right</span>
-                  </div>
-                </div>
-              </div>
 
-              {/* Number Validation Status */}
-              <div className={styles.numberValidation}>
-                <h4>Number Validation:</h4>
-                <div className={styles.validationDetails}>
-                  <div className={styles.validationItem}>
-                    <span className={styles.validationLabel}>Expected:</span>
-                    <span className={styles.validationValue}>{verificationResult.randomNumber}</span>
+                  {/* Gesture Status */}
+                  <div className={styles.gestureStatus}>
+                    <h4>Gesture Status:</h4>
+                    <div className={styles.gestureList}>
+                      <div className={styles.gestureItem}>
+                        <span
+                          className={
+                            verificationResult.gestures.blinkDetected
+                              ? styles.gesturePass
+                              : styles.gestureFail
+                          }
+                        >
+                          {verificationResult.gestures.blinkDetected
+                            ? "✅"
+                            : "❌"}
+                        </span>
+                        <span>Blink Detected</span>
+                      </div>
+                      <div className={styles.gestureItem}>
+                        <span
+                          className={
+                            verificationResult.gestures.smileDetected
+                              ? styles.gesturePass
+                              : styles.gestureFail
+                          }
+                        >
+                          {verificationResult.gestures.smileDetected
+                            ? "✅"
+                            : "❌"}
+                        </span>
+                        <span>Smile Detected</span>
+                      </div>
+                      <div className={styles.gestureItem}>
+                        <span
+                          className={
+                            verificationResult.gestures.headTurnLeft
+                              ? styles.gesturePass
+                              : styles.gestureFail
+                          }
+                        >
+                          {verificationResult.gestures.headTurnLeft
+                            ? "✅"
+                            : "❌"}
+                        </span>
+                        <span>Head Turn Left</span>
+                      </div>
+                      <div className={styles.gestureItem}>
+                        <span
+                          className={
+                            verificationResult.gestures.headTurnRight
+                              ? styles.gesturePass
+                              : styles.gestureFail
+                          }
+                        >
+                          {verificationResult.gestures.headTurnRight
+                            ? "✅"
+                            : "❌"}
+                        </span>
+                        <span>Head Turn Right</span>
+                      </div>
+                    </div>
                   </div>
-                  <div className={styles.validationItem}>
-                    <span className={styles.validationLabel}>Spoken:</span>
-                    <span className={styles.validationValue}>
-                      {verificationResult.numberValidation.spokenNumber || "Not detected"}
-                    </span>
+
+                  {/* Number Validation Status */}
+                  <div className={styles.numberValidation}>
+                    <h4>Number Validation:</h4>
+                    <div className={styles.validationDetails}>
+                      <div className={styles.validationItem}>
+                        <span className={styles.validationLabel}>
+                          Expected:
+                        </span>
+                        <span className={styles.validationValue}>
+                          {verificationResult.randomNumber}
+                        </span>
+                      </div>
+                      <div className={styles.validationItem}>
+                        <span className={styles.validationLabel}>Spoken:</span>
+                        <span className={styles.validationValue}>
+                          {verificationResult.numberValidation.spokenNumber ||
+                            "Not detected"}
+                        </span>
+                      </div>
+                      <div className={styles.validationItem}>
+                        <span className={styles.validationLabel}>Status:</span>
+                        <span
+                          className={
+                            verificationResult.numberValidation.validated
+                              ? styles.statusPass
+                              : styles.statusFail
+                          }
+                        >
+                          {verificationResult.numberValidation.validated
+                            ? "✅ Validated"
+                            : "❌ Not Validated"}
+                        </span>
+                      </div>
+                    </div>
                   </div>
-                  <div className={styles.validationItem}>
-                    <span className={styles.validationLabel}>Status:</span>
-                    <span className={verificationResult.numberValidation.validated ? styles.statusPass : styles.statusFail}>
-                      {verificationResult.numberValidation.validated ? "✅ Validated" : "❌ Not Validated"}
-                    </span>
+
+                  {/* 3D Liveness Status */}
+                  <div className={styles.liveness3D}>
+                    <h4>🔒 3D Liveness Detection:</h4>
+                    <div className={styles.liveness3DDetails}>
+                      <div className={styles.liveness3DItem}>
+                        <span className={styles.liveness3DLabel}>Status:</span>
+                        <span
+                          className={
+                            verificationResult.liveness3D.detected
+                              ? styles.statusPass
+                              : styles.statusFail
+                          }
+                        >
+                          {verificationResult.liveness3D.detected
+                            ? "✅ Real Face Detected"
+                            : "❌ Fake/Photo Detected"}
+                        </span>
+                      </div>
+                      <div className={styles.liveness3DItem}>
+                        <span className={styles.liveness3DLabel}>Score:</span>
+                        <span className={styles.liveness3DValue}>
+                          {verificationResult.liveness3D.score}/100
+                        </span>
+                      </div>
+                      <div className={styles.liveness3DItem}>
+                        <span className={styles.liveness3DLabel}>
+                          Depth Variation:
+                        </span>
+                        <span className={styles.liveness3DValue}>
+                          {verificationResult.liveness3D.depthVariation.toFixed(
+                            3
+                          )}
+                        </span>
+                      </div>
+                      <div className={styles.liveness3DItem}>
+                        <span className={styles.liveness3DLabel}>
+                          Confidence:
+                        </span>
+                        <span className={styles.liveness3DValue}>
+                          {verificationResult.liveness3D.confidence}%
+                        </span>
+                      </div>
+                    </div>
+                    <p className={styles.liveness3DNote}>
+                      {verificationResult.liveness3D.image2DDetected
+                        ? "❌ 2D image detected! Please use a real face, not a photo."
+                        : verificationResult.liveness3D.videoDetected
+                        ? "❌ Video playback detected! This appears to be a video on a screen, not a real face."
+                        : verificationResult.liveness3D.detected
+                        ? "✅ 3D depth analysis confirms this is a real face, not a photo, mask, or video."
+                        : "⚠️ 3D depth analysis could not confirm a real face. This may be a photo, mask, video, or insufficient movement."}
+                    </p>
                   </div>
+
+                  {/* Video Player (Separate - No Audio) */}
+                  {videoUrl && (
+                    <div className={styles.videoPlayerSection}>
+                      <h3>📹 Recorded Video (Video Only)</h3>
+                      <div className={styles.videoPlayerContainer}>
+                        <video
+                          ref={videoPlayerRef}
+                          src={videoUrl}
+                          controls
+                          muted
+                          className={styles.playbackVideo}
+                        />
+                      </div>
+                      <p className={styles.videoPlayerNote}>
+                        Video playback without audio. Use controls to
+                        play/pause.
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Audio Player (Separate) */}
+                  {audioUrl && (
+                    <div className={styles.audioPlayerSection}>
+                      <h3>🎤 Recorded Audio</h3>
+                      <div className={styles.audioPlayerContainer}>
+                        <audio
+                          ref={audioPlayerRef}
+                          src={audioUrl}
+                          controls
+                          className={styles.playbackAudio}
+                        />
+                      </div>
+                      <p className={styles.audioPlayerNote}>
+                        Audio playback. Use controls to play/pause.
+                      </p>
+                    </div>
+                  )}
                 </div>
-              </div>
-            </div>
               </>
             ) : (
               <>
@@ -1350,17 +1974,19 @@ export default function VideoIdentification() {
         )}
 
         {/* Frame Preview Section */}
-        {previewFrames.filter(f => f).length > 0 && (
+        {previewFrames.filter((f) => f).length > 0 && (
           <div className={styles.photoPreview}>
             <h3>Captured Frames:</h3>
             <div className={styles.photoGrid}>
               {previewFrames.map((frame, index) => {
                 if (!frame) return null;
                 const labels = ["Blink", "Smile", "Head Left", "Head Right"];
-  return (
+                return (
                   <div key={index} className={styles.photoItem}>
                     <img src={frame} alt={`Frame ${index + 1}`} />
-                    <span className={styles.photoLabel}>{labels[index] || `Frame ${index + 1}`}</span>
+                    <span className={styles.photoLabel}>
+                      {labels[index] || `Frame ${index + 1}`}
+                    </span>
                   </div>
                 );
               })}
